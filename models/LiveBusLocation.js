@@ -1,0 +1,51 @@
+const { DataTypes } = require("sequelize");
+const sequelize = require("../config/database");
+
+const LiveBusLocation = sequelize.define(
+  "LiveBusLocation",
+  {
+    schedule_id: {
+      type: DataTypes.UUID,
+      primaryKey: true,
+      allowNull: false,
+      references: {
+        model: 'schedules',
+        key: 'id'
+      },
+      onDelete: 'CASCADE'
+    },
+    latitude: {
+      type: DataTypes.DECIMAL(10, 8),
+      allowNull: false,
+    },
+    longitude: {
+      type: DataTypes.DECIMAL(11, 8),
+      allowNull: false,
+    },
+    speed: {
+      type: DataTypes.DECIMAL(5, 2),
+      defaultValue: null,
+      comment: 'Speed in km/h'
+    },
+    heading: {
+      type: DataTypes.DECIMAL(5, 2),
+      defaultValue: null,
+      comment: 'Direction in degrees (0-360)'
+    },
+    recorded_at: {
+      type: DataTypes.DATE,
+      allowNull: false,
+      defaultValue: DataTypes.NOW
+    }
+  },
+  {
+    tableName: "live_bus_locations",
+    timestamps: true,
+    underscored: true,
+    indexes: [
+      { fields: ['recorded_at'] }
+    ]
+  }
+);
+
+module.exports = LiveBusLocation;
