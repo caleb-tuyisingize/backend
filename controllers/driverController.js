@@ -205,12 +205,14 @@ const getDashboard = async (req, res) => {
 		const driver = driverQuery.rows[0];
 		const companyId = driver.company_id;
 
-		// Get assigned buses
+		// Get assigned buses for both canonical user id and legacy driver id
+		const driverIdCandidates = [req.userId];
+		if (driver.id) driverIdCandidates.push(driver.id);
 		const assignmentsQuery = await client.query(
 			`SELECT DISTINCT bus_id 
 			 FROM driver_assignments 
-			 WHERE driver_id = $1 AND unassigned_at IS NULL AND company_id = $2`,
-			[req.userId, companyId]
+			 WHERE driver_id = ANY($1::uuid[]) AND unassigned_at IS NULL AND company_id = $2`,
+			[driverIdCandidates, companyId]
 		);
 
 		const busIds = assignmentsQuery.rows.map(r => r.bus_id).filter(Boolean);
