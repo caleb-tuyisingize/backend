@@ -192,22 +192,30 @@ const getDashboard = async (req, res) => {
 	try {
 		client = await pool.connect();
 
-		// Get driver profile
+		// Get driver profile (legacy drivers table)
 		const driverQuery = await client.query(
 			'SELECT id, company_id FROM drivers WHERE user_id = $1',
 			[req.userId]
 		);
 
-		if (driverQuery.rowCount === 0) {
-			return res.json({ stats: { completed: 0, active: 0, passengers: 0, revenue: 0 }, upcoming: [], recentCheckins: [] });
-		}
-
-		const driver = driverQuery.rows[0];
-		const companyId = driver.company_id;
-
-		// Get assigned buses for both canonical user id and legacy driver id
+		let companyId;
 		const driverIdCandidates = [req.userId];
-		if (driver.id) driverIdCandidates.push(driver.id);
+
+		if (driverQuery.rowCount > 0) {
+			const driver = driverQuery.rows[0];
+			companyId = driver.company_id;
+			if (driver.id) driverIdCandidates.push(driver.id);
+		} else {
+			// Fallback to users table when no legacy driver row exists
+			const userQuery = await client.query(
+				'SELECT company_id FROM users WHERE id = $1',
+				[req.userId]
+			);
+			if (userQuery.rowCount === 0) {
+				return res.json({ stats: { completed: 0, active: 0, passengers: 0, revenue: 0 }, upcoming: [], recentCheckins: [] });
+			}
+			companyId = userQuery.rows[0].company_id;
+		}
 		const assignmentsQuery = await client.query(
 			`SELECT DISTINCT bus_id 
 			 FROM driver_assignments 
@@ -215,7 +223,17 @@ const getDashboard = async (req, res) => {
 			[driverIdCandidates, companyId]
 		);
 
-		const busIds = assignmentsQuery.rows.map(r => r.bus_id).filter(Boolean);
+		let busIds = assignmentsQuery.rows.map(r => r.bus_id).filter(Boolean);
+		if (!busIds || busIds.length === 0) {
+			// Backward-compatible fallback: some deployments still rely on buses.driver_id
+			const busesFallback = await client.query(
+				`SELECT id
+				 FROM buses
+				 WHERE company_id = $1 AND driver_id = ANY($2::uuid[])`,
+				[companyId, driverIdCandidates]
+			);
+			busIds = busesFallback.rows.map(r => r.id).filter(Boolean);
+		}
 		if (!busIds || busIds.length === 0) {
 			return res.json({ stats: { completed: 0, active: 0, passengers: 0, revenue: 0 }, upcoming: [], recentCheckins: [] });
 		}
@@ -229,8 +247,8 @@ const getDashboard = async (req, res) => {
 		// Stats: completed and active schedules for today
 		const statsQ = await client.query(
 			`SELECT
-				 SUM(CASE WHEN s.status = 'completed' THEN 1 ELSE 0 END) AS completed,
-				 SUM(CASE WHEN s.status = 'in_progress' THEN 1 ELSE 0 END) AS active
+				 SUM(CASE WHEN LOWER(COALESCE(s.status, '')) = 'completed' THEN 1 ELSE 0 END) AS completed,
+				 SUM(CASE WHEN LOWER(COALESCE(s.status, '')) IN ('in_progress', 'active') THEN 1 ELSE 0 END) AS active
 			 FROM schedules s
 			 WHERE s.bus_id = ANY($1::uuid[]) AND s.company_id = $2 
 			   AND s.schedule_date >= $3 AND s.schedule_date < $4`,
@@ -263,7 +281,7 @@ const getDashboard = async (req, res) => {
 			 LEFT JOIN buses b ON s.bus_id = b.id
 			 LEFT JOIN routes r ON s.route_id = r.id
 			 WHERE s.bus_id = ANY($1::uuid[]) AND s.company_id = $2 
-			   AND s.status IN ('scheduled', 'in_progress')
+			   AND LOWER(COALESCE(s.status, '')) IN ('scheduled', 'in_progress', 'active')
 			 ORDER BY s.schedule_date ASC, s.departure_time ASC
 			 LIMIT 5`,
 			[busIds, companyId]
