@@ -245,7 +245,7 @@ const getDashboard = async (req, res) => {
 			 INNER JOIN schedules s ON t.schedule_id = s.id
 			 WHERE s.bus_id = ANY($1::uuid[]) AND s.company_id = $2 
 			   AND s.schedule_date >= $3 AND s.schedule_date < $4
-			   AND t.status IN ('CONFIRMED', 'PAID', 'CHECKED_IN')`,
+			   AND t.status IN ('CONFIRMED', 'CHECKED_IN')`,
 			[busIds, companyId, today, tomorrow]
 		);
 

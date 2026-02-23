@@ -201,7 +201,7 @@ function initializeSocket(server) {
         const { scheduleId, ticketId } = data;
         console.log(`👤 Passenger ${socket.userId} attempting to track schedule ${scheduleId}`);
 
-        // Verify passenger has a PAID ticket for this schedule
+        // Verify passenger has a confirmed ticket for this schedule
         const client = await pool.connect();
         const result = await client.query(
           `SELECT t.*, s.status as schedule_status
@@ -209,14 +209,14 @@ function initializeSocket(server) {
            INNER JOIN schedules s ON t.schedule_id = s.id
            WHERE t.id = $1 
              AND t.passenger_id = $2 
-             AND t.status IN ('paid', 'booked', 'checked_in')
+             AND t.status IN ('CONFIRMED', 'CHECKED_IN')
              AND t.schedule_id = $3`,
           [ticketId, socket.userId, scheduleId]
         );
         client.release();
 
         if (result.rows.length === 0) {
-          socket.emit('error', { message: 'No valid paid ticket found for this schedule' });
+          socket.emit('error', { message: 'No valid ticket found for this schedule' });
           return;
         }
 

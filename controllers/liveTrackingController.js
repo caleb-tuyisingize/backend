@@ -337,7 +337,7 @@ const getScheduleLocation = async (req, res) => {
         authorized = true;
       }
     } else if (userRole === 'commuter') {
-      // Commuter must have a paid ticket for this schedule
+      // Commuter must have a confirmed ticket for this schedule
       const pool = require('../config/pgPool');
       const client = await pool.connect();
       try {
@@ -345,7 +345,7 @@ const getScheduleLocation = async (req, res) => {
           `SELECT id FROM tickets 
            WHERE schedule_id = $1 
              AND passenger_id = $2 
-             AND status IN ('paid', 'booked', 'checked_in')
+             AND status IN ('CONFIRMED', 'CHECKED_IN')
            LIMIT 1`,
           [scheduleId, userId]
         );
