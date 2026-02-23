@@ -230,7 +230,7 @@ const getDashboard = async (req, res) => {
 				 SUM(CASE WHEN s.status = 'completed' THEN 1 ELSE 0 END) AS completed,
 				 SUM(CASE WHEN s.status = 'in_progress' THEN 1 ELSE 0 END) AS active
 			 FROM schedules s
-			 WHERE s.bus_id = ANY($1) AND s.company_id = $2 
+			 WHERE s.bus_id = ANY($1::uuid[]) AND s.company_id = $2 
 			   AND s.schedule_date >= $3 AND s.schedule_date < $4`,
 			[busIds, companyId, today, tomorrow]
 		);
@@ -243,7 +243,7 @@ const getDashboard = async (req, res) => {
 			        COALESCE(SUM(CASE WHEN t.price IS NOT NULL THEN t.price ELSE 0 END), 0) AS revenue
 			 FROM tickets t
 			 INNER JOIN schedules s ON t.schedule_id = s.id
-			 WHERE s.bus_id = ANY($1) AND s.company_id = $2 
+			 WHERE s.bus_id = ANY($1::uuid[]) AND s.company_id = $2 
 			   AND s.schedule_date >= $3 AND s.schedule_date < $4
 			   AND t.status IN ('CONFIRMED', 'PAID', 'CHECKED_IN')`,
 			[busIds, companyId, today, tomorrow]
@@ -260,7 +260,7 @@ const getDashboard = async (req, res) => {
 			 FROM schedules s
 			 LEFT JOIN buses b ON s.bus_id = b.id
 			 LEFT JOIN routes r ON s.route_id = r.id
-			 WHERE s.bus_id = ANY($1) AND s.company_id = $2 
+			 WHERE s.bus_id = ANY($1::uuid[]) AND s.company_id = $2 
 			   AND s.status IN ('scheduled', 'in_progress')
 			 ORDER BY s.schedule_date ASC, s.departure_time ASC
 			 LIMIT 5`,
@@ -291,7 +291,7 @@ const getDashboard = async (req, res) => {
 			 INNER JOIN users u ON t.passenger_id = u.id
 			 INNER JOIN schedules s ON t.schedule_id = s.id
 			 LEFT JOIN buses b ON s.bus_id = b.id
-			 WHERE s.bus_id = ANY($1) AND s.company_id = $2 
+			 WHERE s.bus_id = ANY($1::uuid[]) AND s.company_id = $2 
 			   AND t.status = 'CHECKED_IN'
 			 ORDER BY t.checked_in_at DESC
 			 LIMIT 10`,
@@ -318,7 +318,7 @@ const getDashboard = async (req, res) => {
 		res.json({ stats, upcoming, recentCheckins: recent });
 	} catch (err) {
 		console.error('Dashboard error:', err);
-		res.status(400).json({ error: err.message });
+		res.status(500).json({ error: 'Failed to load dashboard', message: err.message });
 	} finally {
 		if (client) client.release();
 	}
@@ -553,9 +553,9 @@ const getDriverContext = async (req, res) => {
 					 ON s.bus_id = b.id 
 					AND s.status IN ('scheduled', 'in_progress')
 				 LEFT JOIN routes r ON r.id = s.route_id
-				 WHERE b.driver_id = $1 AND b.is_active = true
+				 WHERE b.driver_id = $1
 				 ORDER BY s.departure_time ASC NULLS LAST`,
-				[driver.id]
+				[req.userId]
 			);
 
 			const buses = rows.map((row) => ({
