@@ -1,5 +1,7 @@
 const { Payment, Schedule, Ticket, User } = require('../models');
 const pool = require('../config/pgPool');
+const { sendETicketEmail } = require('../services/eTicketService');
+
 // Generate UUID v4 manually if uuid package is not available
 const generateUUID = () => {
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
@@ -495,6 +497,54 @@ const bookTicket = async (req, res) => {
 
       await client.query('COMMIT');
       client.release();
+
+      // Send ticket confirmation email to user
+      try {
+        // Get user information
+        const userQuery = await pool.query(
+          'SELECT email, full_name FROM users WHERE id = $1',
+          [userId]
+        );
+        
+        if (userQuery.rows.length > 0) {
+          const user = userQuery.rows[0];
+          
+          // Get schedule details for email
+          const scheduleDetailsQuery = await pool.query(`
+            SELECT 
+              r.origin, 
+              r.destination, 
+              s.schedule_date,
+              s.departure_time,
+              b.plate_number as bus_plate
+            FROM schedules s
+            LEFT JOIN routes r ON s.route_id = r.id
+            LEFT JOIN buses b ON s.bus_id = b.id
+            WHERE s.id = $1
+          `, [payment.schedule_id]);
+          
+          const scheduleInfo = scheduleDetailsQuery.rows.length > 0 ? scheduleDetailsQuery.rows[0] : null;
+          
+          // Send email (non-blocking - we don't want to fail the booking if email fails)
+          sendETicketEmail({
+            userEmail: user.email,
+            userName: user.full_name || 'Valued Customer',
+            tickets: tickets.map(t => ({
+              id: t.id,
+              seat_number: t.seat_number,
+              booking_ref: t.booking_ref,
+              price: parseFloat(t.price)
+            })),
+            scheduleInfo,
+            companyInfo: { name: 'SafariTix Transport' }
+          }).catch(err => {
+            console.error('Failed to send ticket confirmation email (non-blocking):', err);
+          });
+        }
+      } catch (emailError) {
+        // Log but don't fail the booking
+        console.error('Error preparing ticket confirmation email (non-blocking):', emailError);
+      }
 
       res.status(201).json({
         success: true,
