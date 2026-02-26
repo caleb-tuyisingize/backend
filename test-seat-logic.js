@@ -8,7 +8,7 @@
  * 4. Verify PENDING_PAYMENT/CANCELLED tickets DO NOT lock seats
  */
 
-const API_URL = 'https://backend-7cxc.onrender.com';
+const API_URL = 'http://localhost:5000';
 
 async function testSeatEndpoints() {
   console.log('\n🧪 TESTING SEAT AVAILABILITY LOGIC\n');

@@ -77,10 +77,10 @@ Check:
 Test QR verification endpoint:
 ```bash
 # Using curl:
-curl https://backend-7cxc.onrender.com/api/tickets/verify/BK-2026-ABC123
+curl http://localhost:5000/api/tickets/verify/BK-2026-ABC123
 
 # Using browser:
-https://backend-7cxc.onrender.com/api/tickets/verify/YOUR-BOOKING-REF
+http://localhost:5000/api/tickets/verify/YOUR-BOOKING-REF
 ```
 
 ---

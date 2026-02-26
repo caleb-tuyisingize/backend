@@ -12,12 +12,30 @@ dotenv.config();
 const app = express();
 
 app.use(helmet());
+
+// CORS configuration for both local and production
 const corsOptions = {
-  origin: process.env.FRONTEND_URL || 'http://localhost:5173',
+  origin: function (origin, callback) {
+    // Allow requests with no origin (like mobile apps or curl requests)
+    if (!origin) return callback(null, true);
+    
+    const allowedOrigins = [
+      'http://localhost:5173',
+      'http://localhost:5000',
+      process.env.FRONTEND_URL
+    ].filter(Boolean);
+    
+    if (allowedOrigins.indexOf(origin) !== -1) {
+      callback(null, true);
+    } else {
+      callback(null, true); // Allow all origins in development
+      // In production, you might want to restrict this
+    }
+  },
   credentials: true,
   optionsSuccessStatus: 200
 };
-app.use(cors());
+app.use(cors(corsOptions));
 // Request logging
 app.use(morgan('dev'));
 // Body parsing
