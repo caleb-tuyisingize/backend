@@ -11,6 +11,7 @@ const driverRoutes = require('./driver');
 const busesRoutes = require('./buses');
 const seatsRoutes = require('./seats');
 const liveTrackingRoutes = require('./liveTracking');
+const ticketVerificationController = require('../controllers/ticketVerificationController');
 const publicController = require('../controllers/publicController');
 const auth = require('../middleware/authenticate');
 
@@ -25,6 +26,10 @@ router.use('/driver', driverRoutes);
 router.use('/buses', busesRoutes);
 router.use('/seats', seatsRoutes);
 router.use('/tracking', liveTrackingRoutes);
+
+// Ticket verification endpoints (public for QR scanning)
+router.get('/tickets/verify/:identifier', ticketVerificationController.verifyTicket);
+router.post('/tickets/check-in/:ticketId', auth, ticketVerificationController.checkInTicket);
 
 // Public endpoints (no authentication required)
 router.get('/schedules', publicController.getAvailableSchedules);
