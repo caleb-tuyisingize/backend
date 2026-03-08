@@ -11,6 +11,10 @@ const driverRoutes = require('./driver');
 const busesRoutes = require('./buses');
 const seatsRoutes = require('./seats');
 const liveTrackingRoutes = require('./liveTracking');
+const ussdRoutes = require('./ussd');
+const ruraRoutesRoutes = require('./ruraRoutes');
+const sharedRoutes = require('./shared');
+const sharedRouteController = require('../controllers/sharedRouteController');
 const ticketVerificationController = require('../controllers/ticketVerificationController');
 const publicController = require('../controllers/publicController');
 const auth = require('../middleware/authenticate');
@@ -26,6 +30,16 @@ router.use('/driver', driverRoutes);
 router.use('/buses', busesRoutes);
 router.use('/seats', seatsRoutes);
 router.use('/tracking', liveTrackingRoutes);
+router.use('/ussd', ussdRoutes);
+router.use('/rura_routes', ruraRoutesRoutes);
+router.use('/shared', sharedRoutes);
+
+// Smart segmented booking APIs (From -> To -> Date)
+router.get('/stops', sharedRouteController.getAvailableStops);
+router.get('/search-trips', sharedRouteController.searchTrips);
+router.get('/available-seats', sharedRouteController.getAvailableSeats);
+router.post('/book-ticket', auth, sharedRouteController.bookTicket);
+router.get('/my-tickets', auth, sharedRouteController.getUserTickets);
 
 // Ticket verification endpoints (public for QR scanning)
 router.get('/tickets/verify/:identifier', ticketVerificationController.verifyTicket);
