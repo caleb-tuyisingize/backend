@@ -2,8 +2,30 @@ const { Company, Bus, Schedule, Ticket, User, Driver, Route, DriverAssignment, P
 const crypto = require('crypto');
 const { Op } = require('sequelize');
 const busService = require('../services/busService');
+const NotificationService = require('../services/notificationService');
+const { DEFAULT_PLAN, getPlanPermissions, normalizePlan, hasPlanFeature, isPlanUpgrade } = require('../utils/subscriptionPlans');
 
 let scheduleTimeStorageMode = null; // "time" | "timestamp"
+
+sequelize.query(`
+  CREATE TABLE IF NOT EXISTS subscription_requests (
+    id UUID PRIMARY KEY,
+    company_id UUID NOT NULL REFERENCES companies(id) ON DELETE CASCADE,
+    requested_by UUID REFERENCES users(id) ON DELETE SET NULL,
+    current_plan VARCHAR(50) NOT NULL,
+    requested_plan VARCHAR(50) NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'pending',
+    notes TEXT,
+    reviewed_at TIMESTAMP NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMP NOT NULL DEFAULT NOW()
+  )
+`).catch((err) => console.warn('subscription_requests table init failed:', err.message));
+
+sequelize.query(`
+  CREATE INDEX IF NOT EXISTS idx_subscription_requests_company_created
+  ON subscription_requests(company_id, created_at DESC)
+`).catch((err) => console.warn('subscription_requests index init failed:', err.message));
 
 function normalizeClockTime(value, fieldName) {
   if (value === null || value === undefined || value === '') {
@@ -77,35 +99,198 @@ async function normalizeScheduleTimesForStorage(scheduleDate, departureTime, arr
   };
 }
 
+async function getCompanyPlanContext(companyId) {
+  const company = await Company.findByPk(companyId);
+  const plan = normalizePlan(company?.plan || company?.subscription_plan) || DEFAULT_PLAN;
+  return {
+    company,
+    plan,
+    permissions: getPlanPermissions(plan),
+  };
+}
+
+async function resolveCompanyId(req) {
+  if (req.companyId) return req.companyId;
+  const user = await User.findByPk(req.userId);
+  if (user && user.company_id) return user.company_id;
+  const company = await Company.findOne({ where: { owner_id: req.userId } });
+  return company ? company.id : null;
+}
+
+const mapSubscriptionRequestRow = (row) => {
+  if (!row) return null;
+
+  return {
+    id: row.id,
+    companyId: row.company_id,
+    requestedBy: row.requested_by,
+    currentPlan: normalizePlan(row.current_plan) || DEFAULT_PLAN,
+    requestedPlan: normalizePlan(row.requested_plan) || DEFAULT_PLAN,
+    status: row.status,
+    notes: row.notes || null,
+    reviewedAt: row.reviewed_at || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+};
+
+async function getLatestSubscriptionRequest(companyId) {
+  const [rows] = await sequelize.query(
+    `SELECT *
+     FROM subscription_requests
+     WHERE company_id = $1
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    {
+      bind: [companyId],
+    }
+  );
+
+  return mapSubscriptionRequestRow(rows[0] || null);
+}
+
 // Get company for current user
 const getCompany = async (req, res) => {
   try {
-    // Resolve company id from req (set by requireCompany) or fallback to user/owner
-    const resolveCompanyId = async (req) => {
-      if (req.companyId) return req.companyId;
-      const user = await User.findByPk(req.userId);
-      if (user && user.company_id) return user.company_id;
-      const c = await Company.findOne({ where: { owner_id: req.userId } });
-      return c ? c.id : null;
-    };
-
     const companyId = await resolveCompanyId(req);
     if (!companyId) return res.status(200).json({ company: null });
 
     const company = await Company.findByPk(companyId);
+    const owner = await User.findByPk(company.owner_id);
+    const latestSubscriptionRequest = await getLatestSubscriptionRequest(companyId);
 
     // Map DB fields to frontend expected shape
     const mapped = {
       id: company.id,
       name: company.name,
+      email: company.email || owner?.email || '',
+      phone: company.phone || owner?.phone_number || '',
+      address: company.address || '',
       status: company.status,
+      accountStatus: owner?.account_status || company.status,
+      account_status: owner?.account_status || company.status,
+      companyVerified: !!owner?.company_verified,
+      company_verified: !!owner?.company_verified,
+      is_approved: !!company.is_approved,
+      rejection_reason: company.rejection_reason || null,
       subscriptionStatus: company.subscription_status || 'inactive',
-      subscriptionPaid: !!company.subscription_paid
+      subscriptionPaid: !!company.subscription_paid,
+      plan: normalizePlan(company.plan || company.subscription_plan) || DEFAULT_PLAN,
+      subscriptionPlan: normalizePlan(company.plan || company.subscription_plan) || DEFAULT_PLAN,
+      nextPayment: company.next_payment || null,
+      planPermissions: getPlanPermissions(company.plan || company.subscription_plan || DEFAULT_PLAN),
+      latestSubscriptionRequest,
     };
 
     res.json({ company: mapped });
   } catch (error) {
     console.error('createBus error:', error);
+    res.status(400).json({ error: error.message });
+  }
+};
+
+const getSubscriptionRequest = async (req, res) => {
+  try {
+    const companyId = await resolveCompanyId(req);
+    if (!companyId) {
+      return res.status(200).json({ request: null });
+    }
+
+    const latestRequest = await getLatestSubscriptionRequest(companyId);
+    res.json({ request: latestRequest });
+  } catch (error) {
+    console.error('getSubscriptionRequest error:', error);
+    res.status(400).json({ error: error.message });
+  }
+};
+
+const createSubscriptionRequest = async (req, res) => {
+  try {
+    const companyId = await resolveCompanyId(req);
+    if (!companyId) {
+      return res.status(404).json({ error: 'Company not found' });
+    }
+
+    const requestedPlan = normalizePlan(req.body.requested_plan);
+    if (!requestedPlan) {
+      return res.status(400).json({ error: 'requested_plan must be Starter, Growth, or Enterprise' });
+    }
+
+    const company = await Company.findByPk(companyId);
+    if (!company) {
+      return res.status(404).json({ error: 'Company not found' });
+    }
+
+    const currentPlan = normalizePlan(company.plan || company.subscription_plan) || DEFAULT_PLAN;
+    if (!isPlanUpgrade(currentPlan, requestedPlan)) {
+      return res.status(400).json({ error: 'Only plan upgrades can be requested from this page' });
+    }
+
+    const [pendingRows] = await sequelize.query(
+      `SELECT id
+       FROM subscription_requests
+       WHERE company_id = $1
+         AND status = 'pending'
+         AND requested_plan = $2
+       ORDER BY created_at DESC
+       LIMIT 1`,
+      {
+        bind: [companyId, requestedPlan],
+      }
+    );
+
+    if (pendingRows[0]) {
+      return res.status(409).json({ error: 'A pending request for this plan already exists' });
+    }
+
+    const requestId = crypto.randomUUID();
+    await sequelize.query(
+      `INSERT INTO subscription_requests (
+         id,
+         company_id,
+         requested_by,
+         current_plan,
+         requested_plan,
+         status,
+         created_at,
+         updated_at
+       ) VALUES ($1, $2, $3, $4, $5, 'pending', NOW(), NOW())`,
+      {
+        bind: [requestId, companyId, req.userId, currentPlan, requestedPlan],
+      }
+    );
+
+    const latestRequest = await getLatestSubscriptionRequest(companyId);
+
+    try {
+      await NotificationService.createNotificationForRole(
+        'admin',
+        'Subscription Upgrade Request',
+        `${company.name} requested upgrade from ${currentPlan} to ${requestedPlan}`,
+        'subscription_upgrade_request',
+        {
+          link: '/dashboard/admin/subscription-requests',
+          relatedId: latestRequest?.id || requestId,
+          relatedType: 'subscription_request',
+          data: {
+            companyId,
+            companyName: company.name,
+            currentPlan,
+            requestedPlan,
+          },
+        }
+      );
+    } catch (notificationError) {
+      console.error('createSubscriptionRequest notification error:', notificationError);
+    }
+
+    res.status(201).json({
+      success: true,
+      message: `Upgrade request submitted for ${requestedPlan}`,
+      request: latestRequest,
+    });
+  } catch (error) {
+    console.error('createSubscriptionRequest error:', error);
     res.status(400).json({ error: error.message });
   }
 };
@@ -138,9 +323,23 @@ const createBus = async (req, res) => {
   try {
     console.log('createBus request payload:', req.body, 'userId:', req.userId);
     console.log('Driver ID received:', req.body.driver_id || req.body.driverId || null);
-    const userId = req.userId;
-    const companyId = req.companyId || (await User.findByPk(userId)).company_id;
+    const currentUser = await User.findByPk(req.userId);
+    const companyId = req.companyId || currentUser?.company_id;
     if (!companyId) return res.status(403).json({ error: 'No company associated with user' });
+
+    const { permissions, plan } = await getCompanyPlanContext(companyId);
+    if (permissions.limits.maxBuses !== null) {
+      const existingBusCount = await Bus.count({ where: { company_id: companyId } });
+      if (existingBusCount >= permissions.limits.maxBuses) {
+        return res.status(403).json({
+          error: `The ${plan} plan allows up to ${permissions.limits.maxBuses} buses`,
+          code: 'PLAN_BUS_LIMIT_REACHED',
+          subscriptionPlan: plan,
+          permissions,
+        });
+      }
+    }
+    const userId = req.userId;
 
     const payload = {
       plate_number: req.body.plateNumber || req.body.plate_number,
@@ -850,17 +1049,50 @@ const deleteDriver = async (req, res) => {
 const createSchedule = async (req, res) => {
   try {
     const userId = req.userId;
-    const user = await User.findByPk(userId);
-    const companyId = user?.company_id;
+    const companyId = await resolveCompanyId(req);
     
     if (!companyId) {
       return res.status(403).json({ error: 'No company associated with user' });
     }
 
+    const { permissions, plan } = await getCompanyPlanContext(companyId);
+
     const { busId, routeFrom, routeTo, departureTime, arrivalTime, date, driverId } = req.body;
 
     if (!busId || !routeFrom || !routeTo || !departureTime || !arrivalTime || !date) {
       return res.status(400).json({ error: 'Bus, route, times, and date are required' });
+    }
+
+    const routeCount = await Route.count({ where: { company_id: companyId } });
+    if (!hasPlanFeature(plan, 'unlimitedRoutes') && permissions.limits.maxRoutes !== null) {
+      const routeExists = await Route.findOne({ where: { company_id: companyId, origin: routeFrom, destination: routeTo } });
+      if (!routeExists && routeCount >= permissions.limits.maxRoutes) {
+        return res.status(403).json({
+          error: `The ${plan} plan allows up to ${permissions.limits.maxRoutes} routes`,
+          code: 'PLAN_ROUTE_LIMIT_REACHED',
+          subscriptionPlan: plan,
+          permissions,
+        });
+      }
+    }
+
+    if (!hasPlanFeature(plan, 'advancedSchedules')) {
+      const activeScheduleCount = await Schedule.count({
+        where: {
+          company_id: companyId,
+          schedule_date: { [Op.gte]: new Date().toISOString().slice(0, 10) },
+          status: { [Op.in]: ['scheduled', 'in_progress'] },
+        },
+      });
+
+      if (permissions.limits.maxActiveSchedules !== null && activeScheduleCount >= permissions.limits.maxActiveSchedules) {
+        return res.status(403).json({
+          error: `The ${plan} plan allows up to ${permissions.limits.maxActiveSchedules} active schedules`,
+          code: 'PLAN_SCHEDULE_LIMIT_REACHED',
+          subscriptionPlan: plan,
+          permissions,
+        });
+      }
     }
 
     // Verify bus exists and belongs to this company
@@ -961,8 +1193,7 @@ const createSchedule = async (req, res) => {
 const updateSchedule = async (req, res) => {
   try {
     const userId = req.userId;
-    const user = await User.findByPk(userId);
-    const companyId = user?.company_id;
+    const companyId = await resolveCompanyId(req);
     
     if (!companyId) {
       return res.status(403).json({ error: 'No company associated with user' });
@@ -1133,6 +1364,8 @@ const getDashboardStats = async (req, res) => {
     }
     
     console.log('getDashboardStats for user:', userId, 'company:', companyId);
+
+    const planContext = companyId ? await getCompanyPlanContext(companyId) : null;
     
     if (!companyId) {
       console.log('No company found, returning empty stats');
@@ -1145,7 +1378,9 @@ const getDashboardStats = async (req, res) => {
         weekData: [],
         recentSales: [],
         lastOrders: [],
-        profitBreakdown: {}
+        profitBreakdown: {},
+        subscriptionPlan: DEFAULT_PLAN,
+        planPermissions: getPlanPermissions(DEFAULT_PLAN),
       });
     }
 
@@ -1337,7 +1572,9 @@ const getDashboardStats = async (req, res) => {
       weekData,
       recentSales,
       lastOrders: topOrders,
-      profitBreakdown
+      profitBreakdown,
+      subscriptionPlan: planContext?.plan || DEFAULT_PLAN,
+      planPermissions: planContext?.permissions || getPlanPermissions(DEFAULT_PLAN),
     };
 
     console.log('Returning dashboard stats:', JSON.stringify(responseData, null, 2));
@@ -1473,6 +1710,17 @@ const getRevenue = async (req, res) => {
     }
 
     const { startDate, endDate } = req.query;
+    const { permissions, plan } = await getCompanyPlanContext(companyId);
+
+    if (!hasPlanFeature(plan, 'revenueReports')) {
+      return res.status(403).json({
+        error: 'Revenue reports are only available on the Enterprise plan',
+        code: 'PLAN_FEATURE_BLOCKED',
+        feature: 'revenueReports',
+        subscriptionPlan: plan,
+        permissions,
+      });
+    }
 
     // Build date filters
     let dateFilter = {};
@@ -1604,7 +1852,9 @@ const getRevenue = async (req, res) => {
       monthRevenue: Math.round(monthRevenue),
       monthTickets,
       dailyRevenue,
-      breakdownByRoute
+      breakdownByRoute,
+      subscriptionPlan: plan,
+      planPermissions: permissions,
     });
 
   } catch (error) {
@@ -1641,6 +1891,9 @@ const updateCompany = async (req, res) => {
         address: company.address || null,
         status: company.status,
         subscriptionStatus: company.subscription_status || 'inactive',
+        plan: normalizePlan(company.plan || company.subscription_plan) || DEFAULT_PLAN,
+        nextPayment: company.next_payment || null,
+        planPermissions: getPlanPermissions(company.plan || company.subscription_plan || DEFAULT_PLAN),
       }
     });
   } catch (error) {
@@ -1650,6 +1903,8 @@ const updateCompany = async (req, res) => {
 
 module.exports = {
   getCompany,
+  getSubscriptionRequest,
+  createSubscriptionRequest,
   getBuses,
   createBus,
   assignBusDriver,

@@ -1,5 +1,32 @@
 // services/notificationService.js
+const sequelize = require('../config/database');
 const { Notification } = require('../models');
+const { User } = require('../models');
+
+sequelize.query(`
+  ALTER TABLE notifications
+  ADD COLUMN IF NOT EXISTS user_role VARCHAR(50),
+  ADD COLUMN IF NOT EXISTS link TEXT
+`).catch((err) => console.warn('notifications schema init failed:', err.message));
+
+sequelize.query(`
+  DO $$
+  BEGIN
+    IF EXISTS (
+      SELECT 1
+      FROM pg_type t
+      JOIN pg_enum e ON t.oid = e.enumtypid
+      WHERE t.typname = 'enum_notifications_type'
+        AND e.enumlabel = 'subscription_upgrade_request'
+    ) THEN
+      RETURN;
+    END IF;
+
+    ALTER TYPE enum_notifications_type ADD VALUE 'subscription_upgrade_request';
+  EXCEPTION
+    WHEN duplicate_object THEN NULL;
+  END $$;
+`).catch((err) => console.warn('notifications enum init failed:', err.message));
 
 class NotificationService {
 
@@ -14,6 +41,7 @@ class NotificationService {
   static async createNotification(userId, title, message, type = 'system', extra = {}) {
     return Notification.create({
       user_id: userId,
+      user_role: extra.userRole || null,
       title,
       message,
       type,
@@ -21,7 +49,32 @@ class NotificationService {
       related_id: extra.relatedId || null,
       related_type: extra.relatedType || null,
       data: extra.data || null,
+      link: extra.link || null,
     });
+  }
+
+  static async createNotificationForRole(userRole, title, message, type = 'system', extra = {}) {
+    const recipients = await User.findAll({
+      where: { role: userRole, is_active: true },
+      attributes: ['id'],
+    });
+
+    if (!recipients.length) {
+      return [];
+    }
+
+    return Promise.all(
+      recipients.map((recipient) => NotificationService.createNotification(
+        recipient.id,
+        title,
+        message,
+        type,
+        {
+          ...extra,
+          userRole,
+        }
+      ))
+    );
   }
 
   // Legacy polymorphic-style notify (kept for compatibility)

@@ -300,16 +300,46 @@ const createSharedSchedule = async (req, res) => {
 
     const bus = busResult.rows[0];
     const companyId = req.companyId || bus.company_id || null;
+
+    if (companyId && bus.company_id && String(bus.company_id) !== String(companyId)) {
+      return res.status(403).json({ success: false, message: 'Invalid bus for this company' });
+    }
+
+    if (String(bus.status || '').toUpperCase() !== 'ACTIVE') {
+      return res.status(400).json({ success: false, message: 'Cannot schedule an inactive bus' });
+    }
+
+    const routeResult = await client.query(
+      `
+        SELECT id, price, status
+        FROM rura_routes
+        WHERE id::text = $1::text
+        LIMIT 1
+      `,
+      [route_id]
+    );
+
+    if (!routeResult.rows.length) {
+      return res.status(404).json({ success: false, message: 'Route not found' });
+    }
+
+    if (String(routeResult.rows[0].status || '').toLowerCase() !== 'active') {
+      return res.status(400).json({ success: false, message: 'Only active routes can be scheduled' });
+    }
+
     const scheduleCapacity = toInt(capacity, toInt(bus.capacity, 0));
+
+    if (scheduleCapacity <= 0) {
+      return res.status(400).json({ success: false, message: 'Schedule capacity must be greater than zero' });
+    }
 
     const tableName = await getScheduleTableName(client);
     if (tableName === 'bus_schedules') {
-      // route_id is stored as TEXT (rura_routes.id is integer)
       const inserted = await client.query(
         `
           INSERT INTO bus_schedules (bus_id, route_id, date, time, capacity, company_id, status)
           VALUES ($1, $2::text, $3::date, $4::time, $5, $6, COALESCE($7, 'scheduled'))
-          RETURNING schedule_id, bus_id, route_id, date, time, capacity, booked_seats, available_seats, company_id, status
+          RETURNING schedule_id, bus_id, route_id, date, time, capacity, company_id, status
         `,
         [bus_id, route_id, date, time, scheduleCapacity, companyId, req.body.status || 'scheduled']
       );
@@ -343,7 +373,7 @@ const createSharedSchedule = async (req, res) => {
     return res.status(201).json({ success: true, schedule: inserted.rows[0] });
   } catch (error) {
     console.error('createSharedSchedule error:', error);
-    res.status(500).json({ success: false, message: 'Failed to create schedule' });
+    res.status(500).json({ success: false, message: error.message || 'Failed to create schedule' });
   } finally {
     if (client) client.release();
   }
@@ -1198,6 +1228,8 @@ const getUserTickets = async (req, res) => {
     const tickets = result.rows.map((row) => ({
       id: row.ticket_id,
       ticket_id: row.ticket_id,
+      schedule_id: row.schedule_id,
+      scheduleId: row.schedule_id,
       seat_number: row.seat_number,
       booking_ref: row.booking_ref,
       price: row.price !== null ? Number(row.price) : null,

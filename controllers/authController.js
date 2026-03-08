@@ -3,6 +3,35 @@ const { generateAccessToken, generateRefreshToken, verifyToken } = require('../c
 const pool = require('../config/pgPool');
 const { generateSecureToken } = require('../utils/generateToken');
 const { sendEmail } = require('../utils/mailer');
+const { DEFAULT_PLAN, getPlanPermissions, normalizePlan } = require('../utils/subscriptionPlans');
+
+async function buildUserPayload(user) {
+  if (!user) {
+    throw new Error('User not found');
+  }
+
+  const safeUser = user.toSafeObject();
+  const company = safeUser.company_id ? await Company.findByPk(safeUser.company_id) : null;
+  const companyPlan = normalizePlan(company?.plan || company?.subscription_plan) || DEFAULT_PLAN;
+  const permissions = safeUser.permissions && Object.keys(safeUser.permissions).length
+    ? safeUser.permissions
+    : getPlanPermissions(companyPlan);
+
+  return {
+    id: safeUser.id,
+    name: safeUser.full_name || safeUser.name || '',
+    email: safeUser.email,
+    phone: safeUser.phone_number || safeUser.phone || null,
+    role: safeUser.role,
+    avatar_url: safeUser.avatar_url || null,
+    companyId: safeUser.company_id || null,
+    emailVerified: safeUser.email_verified,
+    companyVerified: safeUser.company_verified,
+    accountStatus: safeUser.account_status,
+    subscriptionPlan: companyPlan,
+    planPermissions: permissions,
+  };
+}
 
 // Helper to compute a default home path for a given role
 function roleHomePath(role) {
@@ -45,29 +74,39 @@ const register = async (req, res) => {
       company_id: req.body.company_id || null
     });
 
-    // If registering a company admin, create an approved company and issue a token
+    // If registering a company admin, create a PENDING company and require email + admin verification
     if (role === 'company_admin') {
+      const { address, country } = req.body;
+
+      if (!company_name) {
+        return res.status(400).json({ error: 'company_name is required for company registration' });
+      }
+
       const company = await Company.create({
         owner_id: user.id,
-        name: company_name || `${full_name} Company`,
+        name: company_name,
         email: email,
         phone: phone_number,
-        status: 'approved',
-        is_approved: true,
-        approval_date: new Date(),
-        approved_by: null
+        address: address || null,
+        country: country || null,
+        status: 'pending',
+        is_approved: false,
       });
 
-      // Link company to user and activate the user immediately
-      await user.update({ company_id: company.id, is_active: true });
+      // Link company to user — keep inactive until email is verified
+      await user.update({
+        company_id: company.id,
+        is_active: false,
+        account_status: 'pending',
+        company_verified: false,
+      });
 
-      const token = generateAccessToken(user.id, user.role);
+      // Send email verification
+      await _sendVerificationEmail(user);
 
       return res.status(201).json({
-        message: 'Company account created and approved',
-        user: user.toSafeObject(),
-        company,
-        token
+        message: 'Company account created. Please check your email to verify your account before continuing.',
+        email: user.email,
       });
     }
 
@@ -172,16 +211,7 @@ const login = async (req, res) => {
     // Update last login timestamp
     await user.update({ last_login: new Date() }).catch(() => {});
 
-    const safeUser = user.toSafeObject();
-    const userPayload = {
-      id: safeUser.id,
-      name: safeUser.full_name || safeUser.name || '',
-      email: safeUser.email,
-      phone: safeUser.phone_number || safeUser.phone || null,
-      role: safeUser.role,
-      avatar_url: safeUser.avatar_url || null,
-      companyId: safeUser.company_id || null,
-    };
+    const userPayload = await buildUserPayload(user);
 
     res.json({
       user: { ...userPayload, homePath: roleHomePath(userPayload.role) },
@@ -239,16 +269,7 @@ const updateProfile = async (req, res) => {
 
     await user.save();
 
-    const safeUser = user.toSafeObject();
-    const userPayload = {
-      id: safeUser.id,
-      name: safeUser.full_name || safeUser.name || '',
-      email: safeUser.email,
-      phone: safeUser.phone_number || safeUser.phone || null,
-      role: safeUser.role,
-      avatar_url: safeUser.avatar_url || null,
-      companyId: safeUser.company_id || null,
-    };
+    const userPayload = await buildUserPayload(user);
 
     res.json({ user: { ...userPayload, homePath: roleHomePath(userPayload.role) } });
   } catch (err) {
@@ -259,16 +280,11 @@ const updateProfile = async (req, res) => {
 const getMe = async (req, res) => {
   try {
     const user = await User.findByPk(req.userId);
-    const safeUser = user.toSafeObject();
-    const userPayload = {
-      id: safeUser.id,
-      name: safeUser.full_name || safeUser.name || '',
-      email: safeUser.email,
-      phone: safeUser.phone_number || safeUser.phone || null,
-      role: safeUser.role,
-      avatar_url: safeUser.avatar_url || null,
-      companyId: safeUser.company_id || null,
-    };
+    if (!user) {
+      return res.status(401).json({ error: 'User account no longer exists' });
+    }
+
+    const userPayload = await buildUserPayload(user);
     res.json({ user: { ...userPayload, homePath: roleHomePath(userPayload.role) }, homePath: roleHomePath(userPayload.role) });
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -431,10 +447,21 @@ const verifyEmail = async (req, res) => {
 
   const { id: verifyId, user_id } = rows[0];
 
-  await User.update({ email_verified: true }, { where: { id: user_id } });
+  // Activate the user account so they can log in after verification
+  const user = await User.findByPk(user_id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  await user.update({ email_verified: true, is_active: true });
   await pool.query('DELETE FROM email_verifications WHERE id = $1', [verifyId]);
 
-  res.json({ message: 'Email verified successfully. You can now log in.' });
+  let message = 'Email verified successfully. You can now log in.';
+  let requiresDocuments = false;
+  if (user.role === 'company_admin') {
+    message = 'Your email is verified. Please submit company verification documents to complete your registration.';
+    requiresDocuments = true;
+  }
+
+  res.json({ message, role: user.role, requiresDocuments });
 };
 
 module.exports = {

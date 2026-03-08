@@ -112,7 +112,66 @@ const searchBusSchedules = async (fromPattern, toPattern, travelDate) => {
 // Get all available schedules for public booking
 const getAvailableSchedules = async (req, res) => {
   try {
-    const { from, to } = req.query;
+    const { from, to, bus_id: busId } = req.query;
+
+    if (busId) {
+      const result = await pool.query(
+        `
+          SELECT
+            bs.schedule_id AS id,
+            bs.bus_id,
+            bs.route_id,
+            bs.date,
+            bs.time,
+            bs.capacity,
+            COALESCE(bs.available_seats, GREATEST(0, bs.capacity - COALESCE(bs.booked_seats, 0))) AS available_seats,
+            COALESCE(bs.booked_seats, 0) AS booked_seats,
+            COALESCE(bs.status, 'scheduled') AS status,
+            rr.from_location,
+            rr.to_location,
+            b.plate_number,
+            b.model,
+            b.status AS bus_status
+          FROM bus_schedules bs
+          INNER JOIN buses b ON b.id = bs.bus_id
+          LEFT JOIN rura_routes rr ON rr.id::text = bs.route_id::text
+          WHERE bs.bus_id::text = $1::text
+          ORDER BY bs.date ASC, bs.time ASC
+        `,
+        [busId]
+      );
+
+      return res.json({
+        schedules: result.rows.map((schedule) => ({
+          id: schedule.id,
+          busId: schedule.bus_id,
+          routeName: schedule.from_location && schedule.to_location ? `${schedule.from_location} → ${schedule.to_location}` : 'Unknown Route',
+          routeFrom: schedule.from_location || 'N/A',
+          routeTo: schedule.to_location || 'N/A',
+          departureLocation: schedule.from_location || 'N/A',
+          destination: schedule.to_location || 'N/A',
+          date: schedule.date,
+          tripDate: schedule.date,
+          departureTime: schedule.time,
+          arrivalTime: null,
+          seatsAvailable: parseInt(schedule.available_seats, 10) || 0,
+          totalSeats: parseInt(schedule.capacity, 10) || 0,
+          seatCapacity: parseInt(schedule.capacity, 10) || 0,
+          bookedSeats: parseInt(schedule.booked_seats, 10) || 0,
+          status: schedule.status,
+          busPlateNumber: schedule.plate_number || 'N/A',
+          busName: schedule.model || schedule.plate_number || 'N/A',
+          bus: {
+            id: schedule.bus_id,
+            plateNumber: schedule.plate_number,
+            plate_number: schedule.plate_number,
+            model: schedule.model,
+            capacity: parseInt(schedule.capacity, 10) || 0,
+            status: schedule.bus_status,
+          },
+        })),
+      });
+    }
 
     // Build where clause for schedules
     let scheduleWhere = {
