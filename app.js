@@ -349,41 +349,83 @@ const connectDatabase = async () => {
 // =====================
 const initializeBackgroundTasks = () => {
   const { SeatLock, Ticket } = require('./models');
+  const paymentController = require('./controllers/paymentController');
+  let cleanupRunning = false;
+  let paymentCleanupRunning = false;
   
   // Expire seat locks
   const expireLocks = async () => {
+    if (cleanupRunning) return;
+    cleanupRunning = true;
     try {
       const now = new Date();
-      const expired = await SeatLock.findAll({ 
-        where: { 
-          status: 'ACTIVE', 
-          expires_at: { [Op.lte]: now } 
-        } 
-      });
-      
-      for (const lock of expired) {
-        try {
-          lock.status = 'EXPIRED';
-          await lock.save();
-          
-          if (lock.ticket_id) {
-            const ticket = await Ticket.findByPk(lock.ticket_id);
-            if (ticket && ticket.status === 'PENDING_PAYMENT') {
-              ticket.status = 'EXPIRED';
-              await ticket.save();
-            }
-          }
-        } catch (e) {
-          console.error('Failed to expire lock', lock.id, e.message || e);
+      const [expiredCount, expiredRows] = await SeatLock.update(
+        {
+          status: 'EXPIRED',
+          updated_at: now,
+        },
+        {
+          where: {
+            status: 'ACTIVE',
+            expires_at: { [Op.lte]: now },
+          },
+          returning: ['id', 'ticket_id'],
         }
+      );
+
+      const expiredTicketIds = (expiredRows || [])
+        .map((row) => row.ticket_id)
+        .filter(Boolean);
+
+      if (expiredTicketIds.length > 0) {
+        await Ticket.update(
+          {
+            status: 'EXPIRED',
+            updated_at: now,
+          },
+          {
+            where: {
+              id: { [Op.in]: expiredTicketIds },
+              status: 'PENDING_PAYMENT',
+            },
+          }
+        );
+      }
+
+      if (expiredCount > 0) {
+        console.log(`⏰ Expired ${expiredCount} seat lock(s)`);
       }
     } catch (err) {
       console.error('expireLocks error', err.message || err);
+    } finally {
+      cleanupRunning = false;
     }
   };
 
-  // Run every 30 seconds
-  setInterval(expireLocks, 30 * 1000);
+  const expirePendingPayments = async () => {
+    if (paymentCleanupRunning) return;
+    paymentCleanupRunning = true;
+    try {
+      const expiredCount = await paymentController.expirePendingPayments();
+      if (expiredCount > 0) {
+        console.log(`💳 Expired ${expiredCount} pending payment hold(s)`);
+      }
+    } catch (err) {
+      console.error('expirePendingPayments error', err.message || err);
+    } finally {
+      paymentCleanupRunning = false;
+    }
+  };
+
+  // Run immediately, then every 30 seconds
+  expireLocks().catch((err) => console.error('Initial expireLocks error', err.message || err));
+  expirePendingPayments().catch((err) => console.error('Initial expirePendingPayments error', err.message || err));
+  setInterval(() => {
+    expireLocks().catch((err) => console.error('Scheduled expireLocks error', err.message || err));
+  }, 30 * 1000);
+  setInterval(() => {
+    expirePendingPayments().catch((err) => console.error('Scheduled expirePendingPayments error', err.message || err));
+  }, 30 * 1000);
   console.log('⏰ Background tasks initialized');
 };
 
