@@ -101,9 +101,9 @@ app.get('/', (req, res) => {
 app.use("/api", activityLogger, routes);
 
 // =====================
-// QR TICKET SCAN ENDPOINT (public — opened by phone after scanning QR)
+// QR TICKET VERIFY ENDPOINT (public — opened by phone after scanning QR)
 // GET /scan/:ticketId
-// Returns an HTML page showing ticket validity status and marks ticket as USED
+// Returns an HTML page showing ticket validity status (no check-in mutation)
 // =====================
 app.get('/scan/:ticketId', async (req, res) => {
   const pool = require('./config/pgPool');
@@ -219,11 +219,8 @@ app.get('/scan/:ticketId', async (req, res) => {
       }));
     }
 
-    // Valid ticket — mark as CHECKED_IN/USED
-    await client.query(
-      `UPDATE tickets SET status = 'CHECKED_IN', checked_in_at = NOW(), updated_at = NOW() WHERE id = $1`,
-      [ticket.id]
-    );
+    // Valid ticket — verification only. Do NOT mutate ticket status here.
+    // Driver check-in must happen through authenticated /api/driver/scan flow.
 
     const dateStr = ticket.dep_date ? String(ticket.dep_date).slice(0, 10) : '—';
     const timeStr = ticket.dep_time ? String(ticket.dep_time).slice(0, 5) : '—';
@@ -231,8 +228,8 @@ app.get('/scan/:ticketId', async (req, res) => {
     if (wantsJson) {
       return res.status(200).json({
         valid: true,
-        status: 'CHECKED_IN',
-        message: 'Ticket valid – passenger checked in',
+        status: 'CONFIRMED',
+        message: 'Ticket valid',
         ticket: {
           bookingRef: ticket.booking_ref,
           passengerName: ticket.passenger_name,
@@ -247,7 +244,7 @@ app.get('/scan/:ticketId', async (req, res) => {
     }
 
     return res.send(renderHtml('Ticket Valid ✓', '✅', '#dcfce7', {
-      sub: 'Welcome aboard! Passenger is cleared to board.',
+      sub: 'Ticket is valid. Driver must scan to check in passenger.',
       rows: [
         ['Passenger', ticket.passenger_name || '—'],
         ['Route', `${ticket.route_from} → ${ticket.route_to}`],

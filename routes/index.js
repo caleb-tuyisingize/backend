@@ -43,7 +43,9 @@ router.get('/my-tickets', auth, sharedRouteController.getUserTickets);
 
 // Ticket verification endpoints (public for QR scanning)
 router.get('/tickets/verify/:identifier', ticketVerificationController.verifyTicket);
+router.post('/tickets/create', auth, ticketVerificationController.createTicket);
 router.post('/tickets/check-in/:ticketId', auth, ticketVerificationController.checkInTicket);
+router.post('/tickets/validate', auth, ticketVerificationController.validateTicket);
 
 // Public endpoints (no authentication required)
 router.get('/schedules', publicController.getAvailableSchedules);

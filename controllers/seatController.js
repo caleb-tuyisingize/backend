@@ -17,8 +17,11 @@ const generateTicketQrDataUrl = async (ticket) => {
   try {
     const payload = {
       ticket_id: ticket.id,
+      ticketId: ticket.id,
       booking_ref: ticket.booking_ref,
       schedule_id: ticket.schedule_id,
+      trip_id: ticket.schedule_id,
+      tripId: ticket.schedule_id,
       seat_number: ticket.seat_number,
       passenger_id: ticket.passenger_id,
       issued_at: new Date().toISOString(),
