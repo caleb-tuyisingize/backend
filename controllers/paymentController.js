@@ -2,6 +2,7 @@ const crypto = require('crypto');
 const QRCode = require('qrcode');
 const pool = require('../config/pgPool');
 const { sendETicketEmail } = require('../services/eTicketService');
+const NotificationService = require('../services/notificationService');
 const {
   initiateCollection,
   getCollectionStatus,
@@ -30,6 +31,40 @@ let _paymentsFkMigratePromise = null;
 const _runPaymentsScheduleFkMigration = async () => {
   const client = await pool.connect();
   try {
+    // Ensure production payment-flow columns exist on legacy databases.
+    await client.query(`
+      ALTER TABLE payments
+      ADD COLUMN IF NOT EXISTS booking_status VARCHAR(32) NOT NULL DEFAULT 'pending_payment',
+      ADD COLUMN IF NOT EXISTS provider_name VARCHAR(64),
+      ADD COLUMN IF NOT EXISTS provider_reference VARCHAR(255),
+      ADD COLUMN IF NOT EXISTS provider_status VARCHAR(64),
+      ADD COLUMN IF NOT EXISTS currency VARCHAR(8) NOT NULL DEFAULT 'RWF',
+      ADD COLUMN IF NOT EXISTS seat_lock_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+      ADD COLUMN IF NOT EXISTS held_ticket_ids JSONB NOT NULL DEFAULT '[]'::jsonb,
+      ADD COLUMN IF NOT EXISTS seat_numbers JSONB NOT NULL DEFAULT '[]'::jsonb,
+      ADD COLUMN IF NOT EXISTS meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+      ADD COLUMN IF NOT EXISTS completed_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS failed_at TIMESTAMPTZ,
+      ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ
+    `).catch(() => {});
+
+    await client.query(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_provider_reference
+      ON payments (provider_reference)
+      WHERE provider_reference IS NOT NULL
+    `).catch(() => {});
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_payments_booking_status
+      ON payments (booking_status)
+    `).catch(() => {});
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_payments_expires_at_pending
+      ON payments (expires_at)
+      WHERE booking_status = 'pending_payment'
+    `).catch(() => {});
+
     // Only migrate when bus_schedules is the active schedule table
     const hasBusSchedules = await client.query(
       `SELECT 1 FROM information_schema.tables
@@ -97,7 +132,8 @@ const readEnv = (...keys) => {
 
 const shouldAutoConfirmPayment = () => {
   const raw = readEnv('AUTO_CONFIRM_PAYMENTS', 'FORCE_PAYMENT_SUCCESS');
-  if (!raw) return true;
+  // Production-safe default: never auto-confirm unless explicitly enabled.
+  if (!raw) return false;
   return ['1', 'true', 'yes', 'on'].includes(String(raw).toLowerCase());
 };
 
@@ -109,6 +145,8 @@ const normalizePhoneNumber = (value) => {
   if (digits.length === 9) return `250${digits}`;
   return digits;
 };
+
+const isSupportedRwandaMsisdn = (value) => /^2507\d{8}$/.test(String(value || ''));
 
 const toIsoDateString = (value) => {
   if (!value) return null;
@@ -402,9 +440,13 @@ const getScheduleOccupancy = async (client, scheduleId, routeStops, fromStop, to
 const buildCallbackUrl = (req) => {
   const configured = readEnv('PAYMENT_WEBHOOK_URL', 'PUBLIC_BACKEND_URL', 'BACKEND_URL', 'APP_URL');
   if (configured) {
-    return configured
+    const normalizedBase = configured
+      .trim()
+      .replace(/\/\$\d+/g, '')
+      .replace(/\$\d+/g, '')
       .replace(/\/$/, '')
-      .replace(/\/api$/, '') + '/api/payments/webhook';
+      .replace(/\/api$/, '');
+    return `${normalizedBase}/api/payments/webhook`;
   }
 
   const host = req.get('host');
@@ -412,18 +454,34 @@ const buildCallbackUrl = (req) => {
   return `${protocol}://${host}/api/payments/webhook`;
 };
 
-const generateTicketQrDataUrl = async (ticket) => {
+const generateTicketQrDataUrl = async ({ ticket, bookingId, userId, scheduleInfo, seats }) => {
   try {
+    // Required QR payload schema:
+    // {
+    //   bookingId,
+    //   userId,
+    //   from,
+    //   to,
+    //   seats,
+    //   date,
+    //   bus
+    // }
+    //
+    // We also include `ticketId` to keep compatibility with existing
+    // ticket validation/scanning logic.
     const payload = {
-      ticket_id: ticket.id,
-      ticketId: ticket.id,
-      booking_ref: ticket.booking_ref,
-      schedule_id: ticket.schedule_id,
-      trip_id: ticket.schedule_id,
-      tripId: ticket.schedule_id,
-      seat_number: ticket.seat_number,
-      payment_id: ticket.payment_id,
-      issued_at: new Date().toISOString(),
+      bookingId: bookingId || null,
+      bookingRef: ticket.booking_ref || ticket.bookingRef || null,
+      userId: userId || null,
+      from: scheduleInfo?.origin || scheduleInfo?.from || null,
+      to: scheduleInfo?.destination || scheduleInfo?.to || null,
+      seats: Array.isArray(seats) ? seats.map((s) => String(s)) : [],
+      seatNumbers: Array.isArray(seats) ? seats.map((s) => String(s)) : [],
+      seatNumber: ticket.seat_number || ticket.seatNumber || null,
+      date: scheduleInfo?.schedule_date || scheduleInfo?.scheduleDate || null,
+      bus: scheduleInfo?.bus_plate || scheduleInfo?.busPlate || null,
+      ticketId: ticket.id || ticket.ticket_id || null,
+      ticketNumber: ticket.booking_ref || ticket.bookingRef || ticket.id || ticket.ticket_id || null,
     };
 
     return await QRCode.toDataURL(JSON.stringify(payload), {
@@ -445,39 +503,85 @@ const getUserInfo = async (userId) => {
   return result.rows[0] || null;
 };
 
-const getScheduleInfoForEmail = async (scheduleId) => {
-  const result = await pool.query(
+const getScheduleInfoForEmail = async (scheduleId, meta = {}) => {
+  const schedulesResult = await pool.query(
     `
-      SELECT r.origin, r.destination, s.schedule_date, s.departure_time, b.plate_number AS bus_plate
+      SELECT
+        r.origin,
+        r.destination,
+        s.schedule_date,
+        s.departure_time,
+        b.plate_number AS bus_plate,
+        COALESCE(c.name, 'SafariTix Transport') AS company_name
       FROM schedules s
       LEFT JOIN routes r ON r.id = s.route_id
       LEFT JOIN buses b ON b.id = s.bus_id
-      WHERE s.id = $1
+      LEFT JOIN companies c ON c.id = s.company_id
+      WHERE s.id::text = $1::text
       LIMIT 1
     `,
     [scheduleId]
   );
-  return result.rows[0] || null;
+
+  if (schedulesResult.rows[0]) {
+    return schedulesResult.rows[0];
+  }
+
+  const busSchedulesResult = await pool.query(
+    `
+      SELECT
+        rr.from_location AS origin,
+        rr.to_location AS destination,
+        bs.date AS schedule_date,
+        bs.time AS departure_time,
+        b.plate_number AS bus_plate,
+        COALESCE(c.name, 'SafariTix Transport') AS company_name
+      FROM bus_schedules bs
+      LEFT JOIN rura_routes rr ON rr.id::text = bs.route_id
+      LEFT JOIN buses b ON b.id = bs.bus_id
+      LEFT JOIN companies c ON c.id = bs.company_id
+      WHERE bs.schedule_id::text = $1::text
+      LIMIT 1
+    `,
+    [scheduleId]
+  ).catch(() => ({ rows: [] }));
+
+  if (busSchedulesResult.rows[0]) {
+    return busSchedulesResult.rows[0];
+  }
+
+  return {
+    origin: meta.from_stop || 'N/A',
+    destination: meta.to_stop || 'N/A',
+    schedule_date: meta.trip_date || null,
+    departure_time: meta.trip_time || meta.departure_time || null,
+    bus_plate: null,
+    company_name: 'SafariTix Transport',
+  };
 };
 
 const sendSuccessfulPaymentEmail = async (paymentRow, tickets) => {
   try {
     if (!tickets.length) return;
+    const meta = paymentRow.meta || {};
     const user = await getUserInfo(paymentRow.user_id);
-    if (!user || !user.email) return;
+    const recipientEmail = user?.email || meta.passenger_email || null;
+    const recipientName = user?.full_name || meta.passenger_name || 'Valued Customer';
+    if (!recipientEmail) {
+      console.warn('[paymentController] Skipping ticket email because no recipient email was found for payment:', paymentRow.id);
+      return;
+    }
 
-    const scheduleInfo = await getScheduleInfoForEmail(paymentRow.schedule_id);
+    const scheduleInfo = await getScheduleInfoForEmail(paymentRow.schedule_id, meta);
     await sendETicketEmail({
-      userEmail: user.email,
-      userName: user.full_name || 'Valued Customer',
-      tickets: tickets.map((ticket) => ({
-        id: ticket.id,
-        seat_number: ticket.seat_number,
-        booking_ref: ticket.booking_ref,
-        price: parseFloat(ticket.price || 0),
-      })),
+      userEmail: recipientEmail,
+      userName: recipientName,
+      // Pass the raw ticket rows so eTicketService can build QR payload consistently.
+      tickets,
       scheduleInfo,
-      companyInfo: { name: 'SafariTix Transport' },
+      companyInfo: { name: scheduleInfo?.company_name || 'SafariTix Transport' },
+      bookingId: paymentRow.id,
+      userId: paymentRow.user_id,
     });
   } catch (error) {
     console.error('[paymentController] Failed to send payment success email:', error.message);
@@ -516,6 +620,38 @@ const isProviderAuthFailure = (error) => {
 // Finalizes held booking into confirmed ticket(s) only after successful payment.
 const createTicketAfterPayment = async ({ client, paymentRow, providerPayload }) => {
   return finalizeSuccessfulPayment(client, paymentRow, providerPayload);
+};
+
+const notifyTicketBooked = async (paymentRow, tickets) => {
+  if (!paymentRow?.user_id || !Array.isArray(tickets) || tickets.length === 0) return;
+
+  const seatPreview = tickets
+    .map((ticket) => String(ticket?.seat_number || '').trim())
+    .filter(Boolean)
+    .slice(0, 4)
+    .join(', ');
+
+  const firstRef = tickets[0]?.booking_ref || tickets[0]?.id || '';
+  const seatsLabel = seatPreview ? ` Seats: ${seatPreview}.` : '';
+
+  try {
+    await NotificationService.createNotification(
+      paymentRow.user_id,
+      'Ticket Confirmed',
+      `Your payment was successful and your ticket is confirmed.${seatsLabel} Ref: ${firstRef}`,
+      'ticket_booked',
+      {
+        relatedId: paymentRow.id,
+        relatedType: 'payment',
+        data: {
+          paymentId: paymentRow.id,
+          ticketIds: tickets.map((ticket) => ticket.id),
+        },
+      }
+    );
+  } catch (err) {
+    console.error('[paymentController] booking notification error:', err.message);
+  }
 };
 
 const insertPaymentRecord = async (client, {
@@ -587,7 +723,16 @@ const insertPaymentRecord = async (client, {
   return result.rows[0];
 };
 
-const createScheduleBookingHold = async ({ client, userId, scheduleId, seatNumbers, paymentMethod, priceOverride }) => {
+const createScheduleBookingHold = async ({
+  client,
+  userId,
+  scheduleId,
+  seatNumbers,
+  paymentMethod,
+  priceOverride,
+  passengerEmail = null,
+  passengerName = null,
+}) => {
   const scheduleResult = await client.query(
     `
       SELECT
@@ -682,7 +827,7 @@ const createScheduleBookingHold = async ({ client, userId, scheduleId, seatNumbe
 
   const activeLocks = await client.query(
     `
-      SELECT id, seat_number, passenger_id, ticket_id, expires_at
+      SELECT id, seat_number, passenger_id, expires_at
       FROM seat_locks
       WHERE schedule_id = $1
         AND seat_number = ANY($2::text[])
@@ -708,32 +853,8 @@ const createScheduleBookingHold = async ({ client, userId, scheduleId, seatNumbe
     const existingLock = lockBySeat.get(String(seatNumber));
     if (existingLock) {
       seatLockIds.push(existingLock.id);
-      if (existingLock.ticket_id) heldTicketIds.push(existingLock.ticket_id);
       continue;
     }
-
-    const ticketId = generateUUID();
-    const ticketResult = await client.query(
-      `
-        INSERT INTO tickets (
-          id, passenger_id, schedule_id, company_id, seat_number,
-          booking_ref, price, status, booked_at, created_at, updated_at
-        ) VALUES (
-          $1, $2, $3, $4, $5,
-          $6, $7, 'PENDING_PAYMENT', NOW(), NOW(), NOW()
-        )
-        RETURNING id
-      `,
-      [
-        ticketId,
-        userId,
-        scheduleId,
-        schedule.company_id,
-        String(seatNumber),
-        buildTicketBookingRef(),
-        pricePerSeat,
-      ]
-    );
 
     const lockId = generateUUID();
     await client.query(
@@ -743,7 +864,7 @@ const createScheduleBookingHold = async ({ client, userId, scheduleId, seatNumbe
           ticket_id, expires_at, status, created_at, updated_at
         ) VALUES (
           $1, $2, $3, $4, $5,
-          $6, $7, 'ACTIVE', NOW(), NOW()
+          NULL, $6, 'ACTIVE', NOW(), NOW()
         )
       `,
       [
@@ -752,18 +873,11 @@ const createScheduleBookingHold = async ({ client, userId, scheduleId, seatNumbe
         schedule.company_id,
         String(seatNumber),
         userId,
-        ticketResult.rows[0].id,
         expiresAt,
       ]
     );
 
-    await client.query(
-      'UPDATE tickets SET lock_id = $1, updated_at = NOW() WHERE id = $2',
-      [lockId, ticketResult.rows[0].id]
-    );
-
     seatLockIds.push(lockId);
-    heldTicketIds.push(ticketResult.rows[0].id);
   }
 
   const payment = await insertPaymentRecord(client, {
@@ -777,13 +891,27 @@ const createScheduleBookingHold = async ({ client, userId, scheduleId, seatNumbe
     heldTicketIds,
     seatNumbers,
     expiresAt,
-    meta: { flow: 'schedule' },
+    meta: {
+      flow: 'schedule',
+      passenger_email: passengerEmail || null,
+      passenger_name: passengerName || null,
+    },
   });
 
   return payment;
 };
 
-const createSegmentBookingHold = async ({ client, userId, scheduleId, seatNumbers, paymentMethod, fromStop, toStop }) => {
+const createSegmentBookingHold = async ({
+  client,
+  userId,
+  scheduleId,
+  seatNumbers,
+  paymentMethod,
+  fromStop,
+  toStop,
+  passengerEmail = null,
+  passengerName = null,
+}) => {
   const scheduleTable = await getScheduleTableName(client);
   const scheduleResult = await client.query(
     scheduleTable === 'bus_schedules'
@@ -903,51 +1031,70 @@ const createSegmentBookingHold = async ({ client, userId, scheduleId, seatNumber
     throw Object.assign(new Error('No active RURA tariff found for the selected segment'), { statusCode: 400 });
   }
 
-  const ticketsColumns = await getTableColumns(client, 'tickets');
   const normalizedTripDate = toIsoDateString(schedule.date);
-  const heldTicketIds = [];
+  const expiresAt = new Date(Date.now() + LOCK_DURATION_MINUTES * 60000);
+  const seatLockIds = [];
 
-  for (const seatNumber of seatNumbers) {
-    const insertColumns = [];
-    const insertValues = [];
-    const params = [];
-    const addColumn = (column, value) => {
-      if (!ticketsColumns.has(column)) return;
-      insertColumns.push(column);
-      params.push(value);
-      insertValues.push(`$${params.length}`);
-    };
+  const activeLocks = await client.query(
+    `
+      SELECT id, seat_number, passenger_id
+      FROM seat_locks
+      WHERE schedule_id::text = $1::text
+        AND seat_number = ANY($2::text[])
+        AND status = 'ACTIVE'
+        AND expires_at > NOW()
+      FOR UPDATE
+    `,
+    [schedule.schedule_id, seatNumbers]
+  );
 
-    addColumn('id', generateUUID());
-    addColumn('schedule_id', schedule.schedule_id);
-    addColumn('passenger_id', userId);
-    addColumn('company_id', schedule.company_id || null);
-    addColumn('route_id', schedule.route_id);
-    addColumn('trip_date', normalizedTripDate);
-    addColumn('from_stop', fromStop);
-    addColumn('to_stop', toStop);
-    addColumn('from_sequence', occupancy.fromSeq);
-    addColumn('to_sequence', occupancy.toSeq);
-    addColumn('seat_number', String(seatNumber));
-    addColumn('price', segPrice);
-    addColumn('status', 'PENDING_PAYMENT');
-    addColumn('booking_ref', buildTicketBookingRef());
-    addColumn('booked_at', new Date());
-    addColumn('created_at', new Date());
-    addColumn('updated_at', new Date());
-
-    const result = await client.query(
-      `
-        INSERT INTO tickets (${insertColumns.join(', ')})
-        VALUES (${insertValues.join(', ')})
-        RETURNING id
-      `,
-      params
-    );
-    heldTicketIds.push(result.rows[0].id);
+  const lockBySeat = new Map(activeLocks.rows.map((row) => [String(row.seat_number), row]));
+  const otherUserLocks = activeLocks.rows.filter((row) => String(row.passenger_id) !== String(userId));
+  if (otherUserLocks.length > 0) {
+    throw Object.assign(new Error(`Seat temporarily locked: ${otherUserLocks.map((row) => row.seat_number).join(', ')}`), { statusCode: 409 });
   }
 
-  const expiresAt = new Date(Date.now() + LOCK_DURATION_MINUTES * 60000);
+  for (const seatNumber of seatNumbers) {
+    const existingLock = lockBySeat.get(String(seatNumber));
+    if (existingLock) {
+      seatLockIds.push(existingLock.id);
+      continue;
+    }
+
+    const lockId = generateUUID();
+    await client.query(
+      `
+        INSERT INTO seat_locks (
+          id, schedule_id, company_id, seat_number, passenger_id,
+          ticket_id, expires_at, status, meta, created_at, updated_at
+        ) VALUES (
+          $1, $2, $3, $4, $5,
+          NULL, $6, 'ACTIVE', $7::jsonb, NOW(), NOW()
+        )
+      `,
+      [
+        lockId,
+        schedule.schedule_id,
+        schedule.company_id || null,
+        String(seatNumber),
+        userId,
+        expiresAt,
+        JSON.stringify({
+          flow: 'segment',
+          from_stop: fromStop,
+          to_stop: toStop,
+          from_sequence: occupancy.fromSeq,
+          to_sequence: occupancy.toSeq,
+          route_id: schedule.route_id,
+          trip_date: normalizedTripDate,
+          price: segPrice,
+        }),
+      ]
+    );
+
+    seatLockIds.push(lockId);
+  }
+
   const payment = await insertPaymentRecord(client, {
     userId,
     scheduleId: schedule.schedule_id,
@@ -955,8 +1102,8 @@ const createSegmentBookingHold = async ({ client, userId, scheduleId, seatNumber
     amount: segPrice * seatNumbers.length,
     currency: 'RWF',
     transactionRef: buildBookingReference(),
-    seatLockIds: [],
-    heldTicketIds,
+    seatLockIds,
+    heldTicketIds: [],
     seatNumbers,
     expiresAt,
     meta: {
@@ -969,6 +1116,8 @@ const createSegmentBookingHold = async ({ client, userId, scheduleId, seatNumber
       bus_id: schedule.bus_id,
       route_id: schedule.route_id,
       trip_date: normalizedTripDate,
+      passenger_email: passengerEmail || null,
+      passenger_name: passengerName || null,
     },
   });
 
@@ -986,69 +1135,35 @@ const finalizeSuccessfulPayment = async (client, paymentRow, providerPayload) =>
 
   const now = new Date();
   const seatLockIds = parseJsonArrayField(paymentRow.seat_lock_ids);
-  const heldTicketIds = parseJsonArrayField(paymentRow.held_ticket_ids);
   const meta = paymentRow.meta || {};
   let tickets = [];
 
-  if (meta.flow === 'segment') {
-    const ticketRows = await client.query(
-      `
-        SELECT *
-        FROM tickets
-        WHERE id = ANY($1::uuid[])
-        FOR UPDATE
-      `,
-      [heldTicketIds]
-    );
-    if (ticketRows.rows.length !== heldTicketIds.length) {
-      throw new Error('One or more held tickets could not be found during payment finalization');
+  // Some environments enforce a DB trigger that blocks ticket insert unless
+  // the linked payment is already marked paid/success.
+  // Mark payment successful first (inside the same transaction) so ticket
+  // inserts satisfy that trigger, while still keeping atomic rollback safety.
+  const preMarkedPayment = await updatePaymentCompat(
+    client,
+    paymentRow.id,
+    {
+      status: 'success',
+      booking_status: 'paid',
+      provider_status: 'success',
+      completed_at: new Date(),
+      failed_at: null,
+    },
+    {
+      prefinalised_at: new Date().toISOString(),
     }
+  );
+  paymentRow = preMarkedPayment || paymentRow;
 
-    const activePending = ticketRows.rows.filter((row) => row.status === 'PENDING_PAYMENT');
-    if (activePending.length !== heldTicketIds.length) {
-      const alreadyConfirmed = ticketRows.rows.every((row) => row.status === 'CONFIRMED' && row.payment_id === paymentRow.id);
-      if (!alreadyConfirmed) {
-        throw new Error('Segment hold is no longer active');
-      }
-    } else {
-      await client.query(
-        `
-          UPDATE tickets
-          SET status = 'CONFIRMED', payment_id = $1, booked_at = NOW(), updated_at = NOW()
-          WHERE id = ANY($2::uuid[])
-        `,
-        [paymentRow.id, heldTicketIds]
-      );
-    }
-
-    const updatedTickets = await client.query(
-      'SELECT * FROM tickets WHERE id = ANY($1::uuid[]) ORDER BY seat_number ASC',
-      [heldTicketIds]
-    );
-    tickets = updatedTickets.rows;
-
-    if ((meta.schedule_source || 'schedules') === 'bus_schedules') {
-      await client.query(
-        `
-          UPDATE bus_schedules
-          SET booked_seats = COALESCE(booked_seats, 0) + $1,
-              updated_at = NOW()
-          WHERE schedule_id::text = $2::text
-        `,
-        [tickets.length, paymentRow.schedule_id]
-      );
-    } else {
-      await client.query(
-        `
-          UPDATE schedules
-          SET available_seats = GREATEST(COALESCE(available_seats, 0) - $1, 0),
-              booked_seats = COALESCE(booked_seats, 0) + $1,
-              updated_at = NOW()
-          WHERE id::text = $2::text
-        `,
-        [tickets.length, paymentRow.schedule_id]
-      );
-    }
+  const existingTickets = await client.query(
+    'SELECT * FROM tickets WHERE payment_id = $1 ORDER BY seat_number ASC',
+    [paymentRow.id]
+  );
+  if (existingTickets.rows.length > 0) {
+    tickets = existingTickets.rows;
   } else {
     const lockRows = await client.query(
       `
@@ -1069,16 +1184,57 @@ const finalizeSuccessfulPayment = async (client, paymentRow, providerPayload) =>
       if (!alreadyConsumed) {
         throw new Error('Seat lock expired before payment confirmation');
       }
-    } else {
-      await client.query(
-        `
-          UPDATE tickets
-          SET status = 'CONFIRMED', payment_id = $1, booked_at = NOW(), updated_at = NOW()
-          WHERE id = ANY($2::uuid[])
-            AND status = 'PENDING_PAYMENT'
-        `,
-        [paymentRow.id, heldTicketIds]
+      const consumedTickets = await client.query(
+        'SELECT * FROM tickets WHERE payment_id = $1 ORDER BY seat_number ASC',
+        [paymentRow.id]
       );
+      tickets = consumedTickets.rows;
+    } else {
+      const ticketColumns = await getTableColumns(client, 'tickets');
+      const seatCount = Math.max(1, activeLocks.length);
+      const defaultPricePerSeat = Number(paymentRow.amount || 0) / seatCount;
+
+      for (const lock of activeLocks) {
+        const lockMeta = typeof lock.meta === 'object' && lock.meta !== null ? lock.meta : {};
+        const insertColumns = [];
+        const insertValues = [];
+        const params = [];
+        const addCol = (column, value) => {
+          if (!ticketColumns.has(column)) return;
+          insertColumns.push(column);
+          params.push(value);
+          insertValues.push(`$${params.length}`);
+        };
+
+        addCol('id', generateUUID());
+        addCol('passenger_id', lock.passenger_id || paymentRow.user_id);
+        addCol('schedule_id', lock.schedule_id || paymentRow.schedule_id);
+        addCol('company_id', lock.company_id || null);
+        addCol('route_id', lockMeta.route_id || meta.route_id || null);
+        addCol('trip_date', lockMeta.trip_date || meta.trip_date || null);
+        addCol('from_stop', lockMeta.from_stop || meta.from_stop || null);
+        addCol('to_stop', lockMeta.to_stop || meta.to_stop || null);
+        addCol('from_sequence', lockMeta.from_sequence || meta.from_sequence || null);
+        addCol('to_sequence', lockMeta.to_sequence || meta.to_sequence || null);
+        addCol('seat_number', String(lock.seat_number));
+        addCol('price', Number(lockMeta.price || defaultPricePerSeat || 0));
+        addCol('status', 'CONFIRMED');
+        addCol('booking_ref', buildTicketBookingRef());
+        addCol('payment_id', paymentRow.id);
+        addCol('booked_at', new Date());
+        addCol('created_at', new Date());
+        addCol('updated_at', new Date());
+
+        const inserted = await client.query(
+          `
+            INSERT INTO tickets (${insertColumns.join(', ')})
+            VALUES (${insertValues.join(', ')})
+            RETURNING *
+          `,
+          params
+        );
+        tickets.push(inserted.rows[0]);
+      }
 
       await client.query(
         `
@@ -1089,28 +1245,49 @@ const finalizeSuccessfulPayment = async (client, paymentRow, providerPayload) =>
         [seatLockIds]
       );
 
-      await client.query(
-        `
-          UPDATE schedules
-          SET available_seats = GREATEST(COALESCE(available_seats, 0) - $1, 0),
-              booked_seats = COALESCE(booked_seats, 0) + $1,
-              updated_at = NOW()
-          WHERE id = $2
-        `,
-        [seatLockIds.length, paymentRow.schedule_id]
-      );
+      if ((meta.schedule_source || 'schedules') === 'bus_schedules') {
+        await client.query(
+          `
+            UPDATE bus_schedules
+            SET booked_seats = COALESCE(booked_seats, 0) + $1,
+                updated_at = NOW()
+            WHERE schedule_id::text = $2::text
+          `,
+          [tickets.length, paymentRow.schedule_id]
+        );
+      } else {
+        await client.query(
+          `
+            UPDATE schedules
+            SET available_seats = GREATEST(COALESCE(available_seats, 0) - $1, 0),
+                booked_seats = COALESCE(booked_seats, 0) + $1,
+                updated_at = NOW()
+            WHERE id::text = $2::text
+          `,
+          [tickets.length, paymentRow.schedule_id]
+        );
+      }
     }
+  }
 
-    const updatedTickets = await client.query(
-      'SELECT * FROM tickets WHERE id = ANY($1::uuid[]) ORDER BY seat_number ASC',
-      [heldTicketIds]
-    );
-    tickets = updatedTickets.rows;
+  let scheduleInfoForQr = null;
+  let seatsForQr = tickets.map((t) => t.seat_number).filter(Boolean);
+  try {
+    scheduleInfoForQr = await getScheduleInfoForEmail(paymentRow.schedule_id, paymentRow.meta || {});
+  } catch (e) {
+    // QR generation should not break booking confirmation.
+    scheduleInfoForQr = null;
   }
 
   for (const ticket of tickets) {
     if (!ticket.qr_code_url) {
-      const qrCodeUrl = await generateTicketQrDataUrl(ticket);
+      const qrCodeUrl = await generateTicketQrDataUrl({
+        ticket,
+        bookingId: paymentRow.id,
+        userId: paymentRow.user_id,
+        scheduleInfo: scheduleInfoForQr,
+        seats: seatsForQr,
+      });
       if (qrCodeUrl) {
         await client.query(
           'UPDATE tickets SET qr_code_url = $1, updated_at = NOW() WHERE id = $2',
@@ -1136,6 +1313,8 @@ const finalizeSuccessfulPayment = async (client, paymentRow, providerPayload) =>
       finalised_at: new Date().toISOString(),
     }
   );
+
+  await notifyTicketBooked(paymentRow, tickets);
 
   return { payment: paymentResult || paymentRow, tickets };
 };
@@ -1233,6 +1412,8 @@ const createBookingHold = async (req, res) => {
       pricePerSeat,
       fromStop,
       toStop,
+      passengerEmail,
+      passengerName,
     } = req.body;
 
     if (!userId) {
@@ -1264,6 +1445,8 @@ const createBookingHold = async (req, res) => {
           paymentMethod,
           fromStop,
           toStop,
+          passengerEmail,
+          passengerName,
         });
       } else {
         payment = await createScheduleBookingHold({
@@ -1273,6 +1456,8 @@ const createBookingHold = async (req, res) => {
           seatNumbers,
           paymentMethod,
           priceOverride: pricePerSeat,
+          passengerEmail,
+          passengerName,
         });
       }
 
@@ -1330,14 +1515,29 @@ const initiatePayment = async (req, res) => {
 
     const resolvedBookingId = booking_id || bookingId || null;
     const resolvedPaymentMethod = payment_method || paymentMethod || null;
-    const resolvedPhone = normalizePhoneNumber(phone_number || phoneNumber || phoneOrCard || '');
+    const phoneInputSource =
+      (typeof phone_number === 'string' && phone_number.trim()) ? 'phone_number' :
+      (typeof phoneNumber === 'string' && phoneNumber.trim()) ? 'phoneNumber' :
+      (typeof phoneOrCard === 'string' && phoneOrCard.trim()) ? 'phoneOrCard' :
+      'none';
+    const rawInputPhone =
+      phoneInputSource === 'phone_number' ? phone_number :
+      phoneInputSource === 'phoneNumber' ? phoneNumber :
+      phoneInputSource === 'phoneOrCard' ? phoneOrCard :
+      '';
+    const resolvedPhone = normalizePhoneNumber(rawInputPhone);
 
     console.log('[initiatePayment] Incoming request:', {
       userId,
       resolvedBookingId,
       resolvedPaymentMethod,
-      rawPhone: phone_number || phoneNumber || phoneOrCard || '(none)',
+      phoneInputSource,
+      rawPhone: rawInputPhone || '(none)',
       normalizedPhone: resolvedPhone ? `***${resolvedPhone.slice(-4)}` : '(empty)',
+      normalizedPhoneFull:
+        process.env.NODE_ENV === 'production'
+          ? undefined
+          : (resolvedPhone || '(empty)'),
       amount,
     });
 
@@ -1345,8 +1545,20 @@ const initiatePayment = async (req, res) => {
       if (!resolvedPaymentMethod || !VALID_PAYMENT_METHODS.includes(resolvedPaymentMethod)) {
         return res.status(400).json({ error: 'payment_method is required and must be valid' });
       }
+      if (resolvedPaymentMethod !== 'card_payment' && phoneInputSource !== 'phone_number') {
+        return res.status(400).json({
+          error: 'phone_number is required',
+          message: 'Provide phone_number from the payment form field.',
+        });
+      }
       if (!resolvedPhone) {
         return res.status(400).json({ error: 'phone_number is required' });
+      }
+      if (!isSupportedRwandaMsisdn(resolvedPhone)) {
+        return res.status(400).json({
+          error: 'phone_number format invalid',
+          message: 'Use a valid Rwanda mobile number (07XXXXXXXX or 2507XXXXXXXX).',
+        });
       }
 
       client = await pool.connect();
@@ -1416,6 +1628,8 @@ const initiatePayment = async (req, res) => {
           await client.query('COMMIT');
           client.release();
 
+          sendSuccessfulPaymentEmail(finalised.payment, finalised.tickets).catch(() => {});
+
           return res.status(200).json({
             success: true,
             payment: serializePayment(finalised.payment),
@@ -1425,7 +1639,7 @@ const initiatePayment = async (req, res) => {
               seat_number: ticket.seat_number,
               status: ticket.status,
             })),
-            message: 'Payment confirmed and ticket booked successfully.',
+            message: 'Ticket confirmed! A copy is being sent to your email.',
           });
         }
 
@@ -1465,41 +1679,46 @@ const initiatePayment = async (req, res) => {
             throw providerError;
           }
 
-          console.warn('[PaymentGateway] Provider auth failed, applying booking fallback:', providerError.message);
-
-          const finalised = await createTicketAfterPayment({
-            client,
-            paymentRow,
-            providerPayload: {
-              fallback_mode: 'provider_auth_failure',
-              provider_error: providerError.message || 'provider_auth_failure',
-              at: new Date().toISOString(),
-            },
-          });
-
-          await client.query('COMMIT');
+          console.warn('[PaymentGateway] Provider auth failed:', providerError.message);
+          await client.query('ROLLBACK');
           client.release();
 
-          return res.status(200).json({
-            success: true,
-            payment: serializePayment(finalised.payment),
-            tickets: finalised.tickets.map((ticket) => ({
-              id: ticket.id,
-              booking_ref: ticket.booking_ref,
-              seat_number: ticket.seat_number,
-              status: ticket.status,
-            })),
-            message: 'Payment provider authentication failed. Booking confirmed in fallback mode.',
+          return res.status(502).json({
+            error: 'Payment provider unavailable',
+            message: 'Unable to initiate payment with provider. Please try again shortly.',
+            details: providerError.message || 'Provider authentication failed',
+            provider: 'mtn',
           });
         }
 
         console.log('[PaymentGateway] Provider response:', {
           provider: providerResponse.provider,
           providerReference: providerResponse.providerReference,
+          acknowledged: providerResponse.acknowledged,
           status: providerResponse.status,
           bookingId: paymentRow.id,
           phone: `***${resolvedPhone.slice(-4)}`,
         });
+
+        // Fail fast: if provider did not return a reference, user should not be
+        // left waiting for a payment that was never created upstream.
+        if (!providerResponse.providerReference || providerResponse.acknowledged !== true) {
+          const failed = await finalizeFailedPayment(
+            client,
+            paymentRow,
+            'provider_reference_missing',
+            providerResponse.raw || { reason: 'provider_reference_missing' }
+          );
+
+          await client.query('COMMIT');
+          client.release();
+
+          return res.status(502).json({
+            error: 'Payment initiation failed',
+            message: 'Provider did not acknowledge payment request. Please try again.',
+            payment: serializePayment(failed.payment),
+          });
+        }
 
         // ── Async / pending path ────────────────────────────────────────────────
         // Provider queued the payment (MTN MoMo sends a USSD push to the phone).
@@ -1575,6 +1794,10 @@ const initiatePayment = async (req, res) => {
 };
 
 const getPaymentStatus = async (req, res) => {
+  await ensurePaymentsScheduleFk().catch((err) =>
+    console.warn('[getPaymentStatus] FK/schema migration skipped:', err.message)
+  );
+
   let client;
   try {
     const userId = req.userId;
@@ -1609,32 +1832,50 @@ const getPaymentStatus = async (req, res) => {
       if (getPaymentBookingStatus(paymentRow) === 'pending_payment' && paymentRow.expires_at && new Date(paymentRow.expires_at) <= now) {
         const failed = await finalizeFailedPayment(client, paymentRow, 'expired', { source: 'poll' });
         paymentRow = failed.payment;
-      } else if (paymentRow.status === 'pending' && paymentRow.provider_reference) {
-        const providerStatus = await checkPaymentStatus({ providerReference: paymentRow.provider_reference });
+      } else {
+        const providerReference = paymentRow.provider_reference || null;
+        if (paymentRow.status === 'pending' && providerReference) {
+          const providerStatus = await checkPaymentStatus({ providerReference });
 
-        console.log('[getPaymentStatus] Provider status for ref', paymentRow.provider_reference, '→', providerStatus.status);
+          console.log('[getPaymentStatus] Provider status for ref', providerReference, '→', providerStatus.status);
 
-        if (providerStatus.status === 'success') {
-          const finalised = await createTicketAfterPayment({
-            client,
-            paymentRow,
-            providerPayload: providerStatus.raw,
-          });
-          paymentRow = finalised.payment;
-          tickets = finalised.tickets;
-          console.log('[getPaymentStatus] Finalized success — tickets:', tickets.length);
-        } else if (providerStatus.status === 'failed') {
-          const failed = await finalizeFailedPayment(client, paymentRow, 'provider_failed', providerStatus.raw);
-          paymentRow = failed.payment;
-          console.log('[getPaymentStatus] Finalized failure');
-        } else {
-          const updated = await updatePaymentCompat(
-            client,
-            paymentRow.id,
-            { provider_status: providerStatus.status },
-            { last_provider_payload: providerStatus.raw || null }
-          );
-          paymentRow = updated || paymentRow;
+          if (providerStatus.status === 'success') {
+            const finalised = await createTicketAfterPayment({
+              client,
+              paymentRow,
+              providerPayload: providerStatus.raw,
+            });
+            paymentRow = finalised.payment;
+            tickets = finalised.tickets;
+            console.log('[getPaymentStatus] Finalized success — tickets:', tickets.length);
+          } else if (providerStatus.status === 'failed') {
+            const failed = await finalizeFailedPayment(client, paymentRow, 'provider_failed', providerStatus.raw);
+            paymentRow = failed.payment;
+            console.log('[getPaymentStatus] Finalized failure');
+          } else {
+            const updated = await updatePaymentCompat(
+              client,
+              paymentRow.id,
+              { provider_status: providerStatus.status },
+              { last_provider_payload: providerStatus.raw || null }
+            );
+            paymentRow = updated || paymentRow;
+          }
+        } else if (paymentRow.status === 'pending' && !providerReference) {
+          const createdAt = paymentRow.created_at ? new Date(paymentRow.created_at) : null;
+          const ageMs = createdAt ? Date.now() - createdAt.getTime() : 0;
+
+          // If provider reference is still missing after a short grace period,
+          // stop waiting and release the seat.
+          if (ageMs > 60 * 1000) {
+            const failed = await finalizeFailedPayment(
+              client,
+              paymentRow,
+              'provider_reference_missing',
+              { source: 'poll', reason: 'provider_reference_missing' }
+            );
+            paymentRow = failed.payment;
+          }
         }
       }
 
@@ -1856,6 +2097,112 @@ const confirmPayment = async (req, res) => {
   });
 };
 
+// Demo endpoint: finalize a booking hold immediately (no external payment provider).
+// POST /api/payments/demo-confirm
+// body: { bookingId | booking_id | paymentId }
+const demoConfirmPayment = async (req, res) => {
+  let client;
+  try {
+    const userId = req.userId;
+    const paymentId = req.body?.bookingId || req.body?.booking_id || req.body?.paymentId || req.body?.id;
+
+    if (!userId) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    if (!paymentId) {
+      return res.status(400).json({ error: 'bookingId is required' });
+    }
+
+    client = await pool.connect();
+    await client.query('BEGIN');
+
+    const paymentResult = await client.query(
+      `
+        SELECT *
+        FROM payments
+        WHERE id = $1 AND user_id = $2
+        FOR UPDATE
+      `,
+      [paymentId, userId]
+    );
+
+    if (!paymentResult.rows.length) {
+      await client.query('ROLLBACK');
+      client.release();
+      return res.status(404).json({ error: 'Booking not found' });
+    }
+
+    const paymentRow = paymentResult.rows[0];
+    const now = new Date();
+
+    if (paymentRow.expires_at && new Date(paymentRow.expires_at) <= now) {
+      const failed = await finalizeFailedPayment(client, paymentRow, 'expired_before_payment', { source: 'demo_confirm' });
+      await client.query('COMMIT');
+      client.release();
+      return res.status(409).json({
+        error: 'Booking hold expired. Please select seats again.',
+        payment: serializePayment(failed.payment),
+      });
+    }
+
+    const finalised = await createTicketAfterPayment({
+      client,
+      paymentRow,
+      providerPayload: { fallback_mode: 'demo_confirm_payment', at: now.toISOString() },
+    });
+
+    await client.query('COMMIT');
+    client.release();
+
+    // Send email (fire-and-forget so API remains responsive).
+    sendSuccessfulPaymentEmail(finalised.payment, finalised.tickets).catch(() => {});
+
+    let scheduleInfo = null;
+    try {
+      scheduleInfo = await getScheduleInfoForEmail(finalised.payment.schedule_id, finalised.payment.meta || {});
+    } catch {
+      scheduleInfo = null;
+    }
+    const seats = (finalised.tickets || []).map((t) => t.seat_number).filter(Boolean);
+
+    return res.status(200).json({
+      success: true,
+      booking: {
+        bookingId: finalised.payment.id,
+        userId: finalised.payment.user_id,
+        from: scheduleInfo?.origin || scheduleInfo?.from || null,
+        to: scheduleInfo?.destination || scheduleInfo?.to || null,
+        seats,
+        date: scheduleInfo?.schedule_date || scheduleInfo?.scheduleDate || null,
+        bus: scheduleInfo?.bus_plate || scheduleInfo?.busPlate || null,
+        departureTime: scheduleInfo?.departure_time || scheduleInfo?.departureTime || null,
+      },
+      payment: serializePayment(finalised.payment),
+      tickets: (finalised.tickets || []).map((ticket) => ({
+        id: ticket.id,
+        ticketId: ticket.id,
+        booking_ref: ticket.booking_ref,
+        bookingRef: ticket.booking_ref,
+        seat_number: ticket.seat_number,
+        seatNumber: ticket.seat_number,
+        qr_code_url: ticket.qr_code_url,
+        qrCodeUrl: ticket.qr_code_url,
+      })),
+      qrCodeUrl: finalised.tickets?.[0]?.qr_code_url || null,
+    });
+  } catch (error) {
+    if (client) {
+      try { await client.query('ROLLBACK'); } catch {}
+      client.release();
+    }
+    console.error('demoConfirmPayment error:', error);
+    return res.status(500).json({
+      error: 'Failed to confirm booking in demo mode',
+      message: error?.message || 'An unexpected error occurred',
+    });
+  }
+};
+
 const failPayment = async (req, res) => {
   const paymentId = req.body.paymentId || req.body.booking_id || req.body.bookingId;
   if (!paymentId) {
@@ -1885,4 +2232,5 @@ module.exports = {
   confirmPayment,
   failPayment,
   bookTicket,
+  demoConfirmPayment,
 };

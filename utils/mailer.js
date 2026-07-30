@@ -8,7 +8,13 @@ try {
   const user = process.env.SMTP_USER;
   const pass = process.env.SMTP_PASS;
   const secure = process.env.SMTP_SECURE === 'true';
-
+console.log({
+  host,
+  port,
+  secure,
+  user,
+  hasPassword: !!pass
+});
   if (host && port && user && pass) {
     transporter = nodemailer.createTransport({ 
       host, 
@@ -24,26 +30,29 @@ try {
   console.error('❌ Failed to initialize email transporter:', e.message);
 }
 
-const sendEmail = async ({ to, subject, text, html }) => {
+const sendEmail = async ({ to, subject, text, html, attachments = [] }) => {
   if (transporter) {
     try {
-      const info = await transporter.sendMail({ 
-        from: `"${process.env.SMTP_FROM_NAME || 'SafariTix'}" <${smtpFromEmail}>`, 
-        to, 
-        subject, 
-        text, 
-        html 
+      const info = await transporter.sendMail({
+        from: `"${process.env.SMTP_FROM_NAME || 'SafariTix'}" <${smtpFromEmail}>`,
+        to,
+        subject,
+        text,
+        html,
+        attachments
       });
+
       console.log('✅ Email sent successfully:', info.messageId);
       return info;
+
     } catch (error) {
-      console.error('❌ Failed to send email:', error.message);
+      console.error('❌ Failed to send email');
+      console.error(error); // <-- Log the full error object
       throw error;
     }
   }
-  // Fallback: log the email
-  console.log('⚠️  Email not sent (no transporter configured) - would have sent:');
-  console.log({ to, subject, text: text?.substring(0, 100) });
+
+  console.log('⚠️ Email not sent (no transporter configured)');
   return Promise.resolve({ fallback: true });
 };
 
